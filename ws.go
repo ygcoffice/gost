@@ -1,146 +1,305 @@
-package main
+package gost
 
 import (
-	//"github.com/ginuerzh/gosocks5"
 	"crypto/tls"
-	"github.com/golang/glog"
-	"github.com/gorilla/websocket"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"time"
+
+	"net/url"
+
+	"github.com/go-log/log"
+	"gopkg.in/gorilla/websocket.v1"
 )
 
-type wsConn struct {
+// WSOptions describes the options for websocket.
+type WSOptions struct {
+	ReadBufferSize    int
+	WriteBufferSize   int
+	HandshakeTimeout  time.Duration
+	EnableCompression bool
+	UserAgent         string
+}
+
+type websocketConn struct {
 	conn *websocket.Conn
 	rb   []byte
 }
 
-func wsClient(conn net.Conn, host string) (*wsConn, error) {
-	c, resp, err := websocket.NewClient(conn, &url.URL{Scheme: "ws", Host: host, Path: "/ws"}, nil, 4096, 4096)
+func websocketClientConn(url string, conn net.Conn, tlsConfig *tls.Config, options *WSOptions) (net.Conn, error) {
+	if options == nil {
+		options = &WSOptions{}
+	}
+	dialer := websocket.Dialer{
+		ReadBufferSize:    options.ReadBufferSize,
+		WriteBufferSize:   options.WriteBufferSize,
+		TLSClientConfig:   tlsConfig,
+		HandshakeTimeout:  options.HandshakeTimeout,
+		EnableCompression: options.EnableCompression,
+		NetDial: func(net, addr string) (net.Conn, error) {
+			return conn, nil
+		},
+	}
+	header := http.Header{}
+	header.Set("User-Agent", DefaultUserAgent)
+	if options.UserAgent != "" {
+		header.Set("User-Agent", options.UserAgent)
+	}
+	c, resp, err := dialer.Dial(url, header)
 	if err != nil {
 		return nil, err
 	}
 	resp.Body.Close()
-
-	return &wsConn{conn: c}, nil
+	return &websocketConn{conn: c}, nil
 }
 
-func wssClient(conn net.Conn, host string) (*wsConn, error) {
-	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
-	if err := tlsConn.Handshake(); err != nil {
-		return nil, err
-	}
-	conn = tlsConn
-
-	c, resp, err := websocket.NewClient(conn, &url.URL{Scheme: "wss", Host: host, Path: "/ws"}, nil, 4096, 4096)
-	if err != nil {
-		return nil, err
-	}
-	resp.Body.Close()
-
-	return &wsConn{conn: c}, nil
-}
-
-func wsServer(conn *websocket.Conn) *wsConn {
-	return &wsConn{
+func websocketServerConn(conn *websocket.Conn) net.Conn {
+	// conn.EnableWriteCompression(true)
+	return &websocketConn{
 		conn: conn,
 	}
 }
 
-func (c *wsConn) Read(b []byte) (n int, err error) {
+func (c *websocketConn) Read(b []byte) (n int, err error) {
 	if len(c.rb) == 0 {
 		_, c.rb, err = c.conn.ReadMessage()
 	}
 	n = copy(b, c.rb)
 	c.rb = c.rb[n:]
-
-	//log.Println("ws r:", n)
-
 	return
 }
 
-func (c *wsConn) Write(b []byte) (n int, err error) {
+func (c *websocketConn) Write(b []byte) (n int, err error) {
 	err = c.conn.WriteMessage(websocket.BinaryMessage, b)
 	n = len(b)
-	//log.Println("ws w:", n)
-
 	return
 }
 
-func (c *wsConn) Close() error {
+func (c *websocketConn) Close() error {
 	return c.conn.Close()
 }
 
-func (c *wsConn) LocalAddr() net.Addr {
+func (c *websocketConn) LocalAddr() net.Addr {
 	return c.conn.LocalAddr()
 }
 
-func (c *wsConn) RemoteAddr() net.Addr {
+func (c *websocketConn) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
 }
 
-func (conn *wsConn) SetDeadline(t time.Time) error {
-	if err := conn.SetReadDeadline(t); err != nil {
+func (c *websocketConn) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
 		return err
 	}
-	return conn.SetWriteDeadline(t)
+	return c.SetWriteDeadline(t)
 }
-func (c *wsConn) SetReadDeadline(t time.Time) error {
+func (c *websocketConn) SetReadDeadline(t time.Time) error {
 	return c.conn.SetReadDeadline(t)
 }
 
-func (c *wsConn) SetWriteDeadline(t time.Time) error {
+func (c *websocketConn) SetWriteDeadline(t time.Time) error {
 	return c.conn.SetWriteDeadline(t)
 }
 
-type ws struct {
-	upgrader websocket.Upgrader
-	arg      Args
+type wsTransporter struct {
+	tcpTransporter
+	options *WSOptions
 }
 
-func NewWs(arg Args) *ws {
-	return &ws{
-		arg: arg,
-		upgrader: websocket.Upgrader{
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
-			CheckOrigin:     func(r *http.Request) bool { return true },
-		},
+// WSTransporter creates a Transporter that is used by websocket proxy client.
+func WSTransporter(opts *WSOptions) Transporter {
+	return &wsTransporter{
+		options: opts,
 	}
 }
 
-func (s *ws) handle(w http.ResponseWriter, r *http.Request) {
-	if glog.V(LDEBUG) {
-		dump, err := httputil.DumpRequest(r, false)
-		if err != nil {
-			glog.Infoln(err)
-		} else {
-			glog.Infoln(string(dump))
-		}
+func (tr *wsTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (net.Conn, error) {
+	opts := &HandshakeOptions{}
+	for _, option := range options {
+		option(opts)
 	}
-	conn, err := s.upgrader.Upgrade(w, r, nil)
+	wsOptions := tr.options
+	if opts.WSOptions != nil {
+		wsOptions = opts.WSOptions
+	}
+	url := url.URL{Scheme: "ws", Host: opts.Addr, Path: "/ws"}
+	return websocketClientConn(url.String(), conn, nil, wsOptions)
+}
+
+type wssTransporter struct {
+	tcpTransporter
+	options *WSOptions
+}
+
+// WSSTransporter creates a Transporter that is used by websocket secure proxy client.
+func WSSTransporter(opts *WSOptions) Transporter {
+	return &wssTransporter{
+		options: opts,
+	}
+}
+
+func (tr *wssTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (net.Conn, error) {
+	opts := &HandshakeOptions{}
+	for _, option := range options {
+		option(opts)
+	}
+	wsOptions := tr.options
+	if opts.WSOptions != nil {
+		wsOptions = opts.WSOptions
+	}
+	if opts.TLSConfig == nil {
+		opts.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	url := url.URL{Scheme: "wss", Host: opts.Addr, Path: "/ws"}
+	return websocketClientConn(url.String(), conn, opts.TLSConfig, wsOptions)
+}
+
+type wsListener struct {
+	addr     net.Addr
+	upgrader *websocket.Upgrader
+	srv      *http.Server
+	connChan chan net.Conn
+	errChan  chan error
+}
+
+// WSListener creates a Listener for websocket proxy server.
+func WSListener(addr string, options *WSOptions) (Listener, error) {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
-		glog.V(LERROR).Infoln(err)
+		return nil, err
+	}
+	if options == nil {
+		options = &WSOptions{}
+	}
+	l := &wsListener{
+		addr: tcpAddr,
+		upgrader: &websocket.Upgrader{
+			ReadBufferSize:    options.ReadBufferSize,
+			WriteBufferSize:   options.WriteBufferSize,
+			CheckOrigin:       func(r *http.Request) bool { return true },
+			EnableCompression: options.EnableCompression,
+		},
+		connChan: make(chan net.Conn, 1024),
+		errChan:  make(chan error, 1),
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/ws", http.HandlerFunc(l.upgrade))
+	l.srv = &http.Server{Addr: addr, Handler: mux}
+
+	ln, err := net.ListenTCP("tcp", tcpAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		err := l.srv.Serve(tcpKeepAliveListener{ln})
+		if err != nil {
+			l.errChan <- err
+		}
+		close(l.errChan)
+	}()
+	select {
+	case err := <-l.errChan:
+		return nil, err
+	default:
+	}
+
+	return l, nil
+}
+
+func (l *wsListener) upgrade(w http.ResponseWriter, r *http.Request) {
+	log.Logf("[ws] %s -> %s", r.RemoteAddr, l.addr)
+	if Debug {
+		dump, _ := httputil.DumpRequest(r, false)
+		log.Log(string(dump))
+	}
+	conn, err := l.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Logf("[ws] %s - %s : %s", r.RemoteAddr, l.addr, err)
 		return
 	}
-	handleConn(wsServer(conn), s.arg)
-}
-
-func (s *ws) ListenAndServe() error {
-	sm := http.NewServeMux()
-	sm.HandleFunc("/ws", s.handle)
-	return http.ListenAndServe(s.arg.Addr, sm)
-}
-
-func (s *ws) listenAndServeTLS() error {
-	sm := http.NewServeMux()
-	sm.HandleFunc("/ws", s.handle)
-	server := &http.Server{
-		Addr:      s.arg.Addr,
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{s.arg.Cert}},
-		Handler:   sm,
+	select {
+	case l.connChan <- websocketServerConn(conn):
+	default:
+		conn.Close()
+		log.Logf("[ws] %s - %s: connection queue is full", r.RemoteAddr, l.addr)
 	}
-	return server.ListenAndServeTLS("", "")
+}
+
+func (l *wsListener) Accept() (conn net.Conn, err error) {
+	select {
+	case conn = <-l.connChan:
+	case err = <-l.errChan:
+	}
+	return
+}
+
+func (l *wsListener) Close() error {
+	return l.srv.Close()
+}
+
+func (l *wsListener) Addr() net.Addr {
+	return l.addr
+}
+
+type wssListener struct {
+	*wsListener
+}
+
+// WSSListener creates a Listener for websocket secure proxy server.
+func WSSListener(addr string, tlsConfig *tls.Config, options *WSOptions) (Listener, error) {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if options == nil {
+		options = &WSOptions{}
+	}
+	l := &wssListener{
+		wsListener: &wsListener{
+			addr: tcpAddr,
+			upgrader: &websocket.Upgrader{
+				ReadBufferSize:    options.ReadBufferSize,
+				WriteBufferSize:   options.WriteBufferSize,
+				CheckOrigin:       func(r *http.Request) bool { return true },
+				EnableCompression: options.EnableCompression,
+			},
+			connChan: make(chan net.Conn, 1024),
+			errChan:  make(chan error, 1),
+		},
+	}
+
+	if tlsConfig == nil {
+		tlsConfig = DefaultTLSConfig
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/ws", http.HandlerFunc(l.upgrade))
+	l.srv = &http.Server{
+		Addr:      addr,
+		TLSConfig: tlsConfig,
+		Handler:   mux,
+	}
+
+	ln, err := net.ListenTCP("tcp", tcpAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		err := l.srv.Serve(tls.NewListener(tcpKeepAliveListener{ln}, tlsConfig))
+		if err != nil {
+			l.errChan <- err
+		}
+		close(l.errChan)
+	}()
+	select {
+	case err := <-l.errChan:
+		return nil, err
+	default:
+	}
+
+	return l, nil
 }
